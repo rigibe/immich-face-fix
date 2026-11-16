@@ -187,8 +187,17 @@ let countdownMode = "fix"; // "fix" or "skip"
 
 // --- API helpers ---
 async function api(path, opts = {}) {
-  const resp = await fetch(path, opts);
-  if (!resp.ok) throw new Error(`API ${resp.status}: ${path}`);
+  const headers = new Headers(opts.headers || {});
+  headers.set("X-Face-Fix", "1");
+  const resp = await fetch(path, { ...opts, headers });
+  if (!resp.ok) {
+    let detail = "";
+    try {
+      const body = await resp.json();
+      detail = body.error || body.message || "";
+    } catch {}
+    throw new Error(`API ${resp.status}: ${detail || path}`);
+  }
   return resp;
 }
 async function apiJSON(path, opts = {}) {
@@ -429,6 +438,7 @@ async function showNextAsset() {
   $("#photo-loading").style.display = "flex";
   while (currentIndex < assetIds.length) {
     const assetId = assetIds[currentIndex];
+    currentItem = null;
 
     updatePositionHeader();
 
@@ -440,7 +450,9 @@ async function showNextAsset() {
       try {
         faces = await apiJSON(`/api/faces?assetId=${assetId}`);
       } catch {
-        faces = [];
+        $("#photo-loading").style.display = "none";
+        alert("Could not load faces for this photo. No automatic action was taken; retry the review.");
+        return;
       }
     }
 
@@ -474,7 +486,7 @@ async function showNextAsset() {
 
     // Auto-fix logic: check if Immich's top suggestion matches correctPerson
     // Skip auto-fix if we got here via undo — user wants to manually review
-    if (autoFixMode !== "off" && !shouldSkipAutoFix) {
+    if (autoFixMode !== "off" && !shouldSkipAutoFix && !isDup) {
       const autoFixResult = await tryAutoFix(wrongFaces, assetId);
       if (autoFixResult && autoFixResult.action === "instant") {
         currentIndex++;
@@ -760,6 +772,7 @@ async function tryAutoFix(wrongFaces, assetId) {
     return { action: "confirm-skip" };
   }
   if (autoFixMode === "instant") {
+    if (!await canAutoReassign(assetId, facesToFix)) return null;
     for (const face of facesToFix) {
       await reassignFaceAPI(face.id, correctPerson.id);
       undoStack.push({ faceId: face.id, oldPersonId: wrongPerson.id, assetId, wasAutoFixed: true });
@@ -781,8 +794,17 @@ async function getTopSuggestion(faceId) {
 
 async function autoReassignCurrent() {
   if (!countdownAutoFixFaces || !currentItem) return;
+  const item = currentItem;
   const faces = countdownAutoFixFaces;
   countdownAutoFixFaces = null;
+  const safe = await canAutoReassign(item.assetId, faces);
+  if (currentItem !== item) return;
+  if (!safe) {
+    alert("The photo could not be safely auto-fixed. Please review it manually.");
+    currentItem.autoFixableFaces = null;
+    drawOverlays();
+    return;
+  }
   for (const face of faces) {
     await reassignFaceAPI(face.id, correctPerson.id);
     undoStack.push({ faceId: face.id, oldPersonId: wrongPerson.id, assetId: currentItem.assetId, wasAutoFixed: true });
@@ -792,6 +814,24 @@ async function autoReassignCurrent() {
   markReviewed(currentItem.assetId);
   currentIndex++;
   showNextAsset();
+}
+
+async function canAutoReassign(assetId, candidates) {
+  if (candidates.length !== 1) return false;
+  try {
+    let faces;
+    try {
+      faces = await apiJSON(`/api/faces?id=${assetId}`);
+    } catch {
+      faces = await apiJSON(`/api/faces?assetId=${assetId}`);
+    }
+    return Array.isArray(faces) &&
+      faces.filter(f => f.person && f.person.id === wrongPerson.id).length === 1 &&
+      faces.some(f => f.id === candidates[0].id && f.person && f.person.id === wrongPerson.id) &&
+      !faces.some(f => f.person && f.person.id === correctPerson.id);
+  } catch {
+    return false;
+  }
 }
 
 function autoSkipCurrent() {

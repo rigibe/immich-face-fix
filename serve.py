@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 import threading
+import urllib.parse
 import urllib.request
 import urllib.error
 import webbrowser
@@ -94,6 +95,7 @@ def main():
                         help=f".env variable holding the Immich URL (default: {URL_VARS[0]})")
     parser.add_argument("--port", type=int, default=None,
                         help="Local port (default: 8080)")
+    parser.add_argument("--host", default=None, help="Bind address (default: 127.0.0.1)")
     args = parser.parse_args()
 
     env_path = find_env_file(args.env_file)
@@ -116,6 +118,7 @@ def main():
         args.port
         or int(os.environ.get("PORT") or env.get("PORT") or "8080")
     )
+    host = args.host or os.environ.get("HOST") or env.get("HOST") or "127.0.0.1"
 
     if not immich_url or not api_key:
         source = env_path or "no .env file found"
@@ -157,6 +160,8 @@ def main():
             super().end_headers()
 
         def do_GET(self):
+            if not self._safe_request():
+                return
             if self.path == "/api/_immich-url":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -165,7 +170,41 @@ def main():
             elif self.path.startswith("/api/"):
                 self._proxy("GET")
             else:
+                path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+                relative = path.lstrip("/") or "index.html"
+                parts = relative.split("/")
+                allowed = (relative in ("index.html", "screenshot.png") if directory == base_dir
+                           else all(p and not p.startswith(".") for p in parts)
+                           and os.path.splitext(relative)[1].lower() in
+                           (".html", ".js", ".css", ".png", ".jpg", ".jpeg", ".svg", ".ico", ".woff", ".woff2"))
+                resolved = os.path.realpath(os.path.join(directory, relative))
+                if not allowed or not resolved.startswith(os.path.realpath(directory) + os.sep):
+                    self.send_error(404)
+                    return
                 super().do_GET()
+
+        def do_HEAD(self):
+            self.send_error(405)
+
+        def _safe_request(self):
+            try:
+                authority = urllib.parse.urlsplit("http://" + self.headers.get("Host", ""))
+                valid_host = (authority.hostname in ("localhost", "127.0.0.1")
+                              and authority.port == self.server.server_port)
+            except ValueError:
+                valid_host = False
+            if host in ("127.0.0.1", "localhost") and not valid_host:
+                self.send_error(403, "Invalid host")
+                return False
+            origin = self.headers.get("Origin")
+            expected = "http://" + self.headers.get("Host", "")
+            if (origin and origin != expected) or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                self.send_error(403, "Cross-origin request denied")
+                return False
+            if self.command != "GET" and self.headers.get("X-Face-Fix") != "1":
+                self.send_error(403, "Missing request header")
+                return False
+            return True
 
         def do_PUT(self):
             self._proxy("PUT")
@@ -177,6 +216,10 @@ def main():
             self._proxy("DELETE")
 
         def _proxy(self, method):
+            if not self.path.startswith("/api/") or not self._safe_request():
+                if not self.path.startswith("/api/"):
+                    self.send_error(404)
+                return
             target = immich_url + self.path
             body = None
             if method in ("PUT", "POST"):
@@ -186,7 +229,7 @@ def main():
 
             req = urllib.request.Request(target, data=body, method=method)
             req.add_header("x-api-key", api_key)
-            req.add_header("User-Agent", self.headers.get("User-Agent", USER_AGENT))
+            req.add_header("User-Agent", USER_AGENT)
             if self.headers.get("Content-Type"):
                 req.add_header("Content-Type", self.headers["Content-Type"])
             req.add_header("Accept", self.headers.get("Accept", "application/json"))
@@ -216,7 +259,9 @@ def main():
             if a:
                 print(f"  {' '.join(str(x) for x in a)}")
 
-    server = http.server.HTTPServer(("", port), Handler)
+    server = http.server.ThreadingHTTPServer((host, port), Handler)
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print("WARNING: The proxy has no authentication; network clients can control the configured Immich account.")
     url = f"http://localhost:{port}/"
     print(f"Immich Face Fix running at {url}")
     print(f"Proxying to {immich_url}")

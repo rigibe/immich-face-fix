@@ -129,6 +129,15 @@ use.
 | `--api-key-var` | `.env` variable holding the API key | `IMMICH_API_KEY` |
 | `--url-var` | `.env` variable holding the Immich URL | `IMMICH_URL` |
 | `--port` | Local port | 8080 |
+| `--host` | Bind address (`HOST` also supported) | `127.0.0.1` |
+
+The proxy is not authenticated. Binding to a non-loopback address exposes control
+of the configured Immich account to network clients; only do so on a trusted network.
+Cross-origin request checks reduce browser-based risks but are not authentication.
+Only UI assets are served, not configuration files.
+
+Run the focused tests with `python3 -m unittest discover -s test -p 'test_*.py'`
+and `node --test test/*.test.cjs` (Node.js is needed only for the JavaScript test).
 
 ## Usage
 
@@ -157,6 +166,10 @@ For each face assigned to the wrong person, the tool queries Immich for its top 
 - **Instant mode** — reassign immediately without showing the photo
 - **Confirm mode** — show the photo with a countdown timer; press any key to cancel and review manually
 - **Off** — always require manual review
+
+Photos with multiple faces assigned to the wrong person, or with the target person
+already present, require manual review. Before an automatic reassignment the app
+rechecks the photo; this check is not atomic with changes made elsewhere in Immich.
 
 ### Session Persistence
 
