@@ -71,12 +71,16 @@ h2 { margin-bottom: 12px; font-size: 1.2em; }
 
 /* Preload hidden */
 .preload-img { position: absolute; left: -9999px; top: -9999px; width: 1px; height: 1px; opacity: 0; }
+.notice { margin: 10px 0; padding: 10px 14px; border-radius: 6px; background: #173b53; color: #dcefff; }
+.notice.error { background: #5a202d; color: #fff; }
 </style>
 </head>
 <body>
 <div class="container">
 <h1>Immich Face Fix</h1>
 <div id="account-info"></div>
+<div id="ownership-notice" class="notice" role="status" style="display:none"></div>
+<div id="error-notice" class="notice error" role="alert" style="display:none"></div>
 
 <!-- Phase 1: Setup -->
 <div id="setup">
@@ -138,11 +142,15 @@ h2 { margin-bottom: 12px; font-size: 1.2em; }
       <button class="btn btn-secondary" id="btn-quit" style="font-size:12px">Quit (Q)</button>
     </div>
   </div>
+  <div id="photo-date" style="text-align:center; color:#aaa; padding:8px"></div>
   <div class="photo-container" id="photo-container">
     <img id="photo-img" src="">
     <div class="photo-loading" id="photo-loading" style="display:none"><div class="spinner"></div></div>
   </div>
   <div class="face-crops" id="face-crops"></div>
+  <div id="suggestions" style="text-align:center; color:#aaa; padding:8px"></div>
+  <div style="text-align:center">
+  </div>
   <div class="shortcuts" id="shortcut-help"></div>
   <div id="countdown-bar" style="display:none; text-align:center; padding:8px 0; font-size:15px; font-weight:600; color:#e94560"></div>
 </div>
@@ -169,6 +177,7 @@ const $ = (s) => document.querySelector(s);
 let allPeople = [];
 let wrongPerson = null, correctPerson = null;
 let assetIds = [];       // just IDs, not full objects
+let assetDates = new Map();
 let currentIndex = 0;    // index into assetIds
 let currentItem = null;  // { assetId, faces, wrongFaces, correctPresent }
 let undoStack = [];
@@ -186,7 +195,14 @@ let countdownAutoFixFaces = null; // faces to auto-fix when countdown completes
 let countdownMode = "fix"; // "fix" or "skip"
 
 // --- API helpers ---
+function showNotice(id, message) {
+  const notice = document.getElementById(id);
+  notice.textContent = message;
+  notice.style.display = message ? "block" : "none";
+}
+
 async function api(path, opts = {}) {
+  if (opts.method && opts.method !== "GET") showNotice("error-notice", "");
   const headers = new Headers(opts.headers || {});
   headers.set("X-Face-Fix", "1");
   const resp = await fetch(path, { ...opts, headers });
@@ -196,7 +212,11 @@ async function api(path, opts = {}) {
       const body = await resp.json();
       detail = body.error || body.message || "";
     } catch {}
-    throw new Error(`API ${resp.status}: ${detail || path}`);
+    const error = new Error(`API ${resp.status}: ${detail || path}`);
+    if (opts.method && opts.method !== "GET") {
+      showNotice("error-notice", `The request failed. Check the current state before retrying. ${error.message}`);
+    }
+    throw error;
   }
   return resp;
 }
@@ -361,6 +381,8 @@ function updateSessionInfo() {
 // --- Start session: fetch asset IDs only, then go straight to review ---
 async function startSession() {
   if (wrongPerson.id === correctPerson.id) { alert("Pick two different people."); return; }
+  showNotice("ownership-notice", "");
+  showNotice("error-notice", "");
   skipBothPresent = $("#chk-skip-both").checked;
   scanMode = document.querySelector('input[name="scan-mode"]:checked').value;
   autoFixMode = document.querySelector('input[name="autofix-mode"]:checked').value;
@@ -384,9 +406,24 @@ async function startSession() {
   $("#loading-assets").style.display = "block";
   $("#loading-status").textContent = "Fetching asset list...";
 
+  let ownerId;
+  try {
+    const me = await apiJSON("/api/users/me");
+    if (!me || typeof me.id !== "string" || !me.id) throw new Error("Missing account ID");
+    ownerId = me.id;
+  } catch {
+    $("#loading-assets").style.display = "none";
+    $("#setup").style.display = "block";
+    showNotice("error-notice", "Could not identify the connected account. No photos were loaded.");
+    return;
+  }
+
   // Fetch asset IDs via search API (paginated, fast — no face data)
   assetIds = [];
+  assetDates = new Map();
+  let excludedAssets = 0;
   let searchPage = 1;
+  try {
   while (true) {
     const result = await apiJSON(`/api/search/metadata`, {
       method: "POST",
@@ -395,10 +432,31 @@ async function startSession() {
     });
     const items = result.assets?.items || result.items || result;
     if (!Array.isArray(items) || items.length === 0) break;
-    assetIds.push(...items.map(a => a.id));
+    const owned = ownedAssetIds(items, ownerId);
+    for (const item of items) {
+      if (item.ownerId === ownerId) assetDates.set(item.id, item.localDateTime || item.fileCreatedAt);
+    }
+    excludedAssets += items.length - owned.length;
+    assetIds.push(...owned);
     $("#loading-status").textContent = `Found ${assetIds.length} assets...`;
     if (!result.assets?.nextPage && !result.nextPage) break;
     searchPage++;
+  }
+  } catch (error) {
+    $("#loading-assets").style.display = "none";
+    $("#setup").style.display = "block";
+    showNotice("error-notice", `Could not safely load photos: ${error.message}`);
+    return;
+  }
+
+  if (excludedAssets) showNotice("ownership-notice", `${excludedAssets} photos owned by other accounts were excluded.`);
+
+  // Exclude only photos known to predate the target person's birth; leave unknown dates for review.
+  const beforeBirth = assetIds.filter(id => isBeforeBirth(assetDates.get(id), correctPerson.birthDate));
+  assetIds = assetIds.filter(id => !isBeforeBirth(assetDates.get(id), correctPerson.birthDate));
+  if (beforeBirth.length) {
+    const notice = $("#ownership-notice").textContent;
+    showNotice("ownership-notice", `${notice}${notice ? " " : ""}${beforeBirth.length} photos taken before the correct person's birth were excluded.`);
   }
 
   totalAssets = assetIds.length;
@@ -407,8 +465,9 @@ async function startSession() {
   assetIds = assetIds.filter(id => !reviewedAssets.has(id));
 
   if (assetIds.length === 0 && totalAssets === 0) {
-    alert("No assets found for this person.");
-    location.reload();
+    $("#loading-assets").style.display = "none";
+    $("#setup").style.display = "block";
+    showNotice("error-notice", "No eligible photos owned by this account were found for this person.");
     return;
   }
 
@@ -427,6 +486,33 @@ async function startSession() {
   showNextAsset();
 }
 
+function ownedAssetIds(items, ownerId) {
+  if (!ownerId || items.some(item => !item || typeof item.ownerId !== "string" || !item.ownerId || !item.id)) {
+    throw new Error("A photo owner could not be verified");
+  }
+  return items.filter(item => item.ownerId === ownerId).map(item => item.id);
+}
+
+function calendarDate(value) {
+  const match = typeof value === "string" && /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
+  if (!match) return null;
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  return date.toISOString().slice(0, 10) === match[0] ? match[0] : null;
+}
+
+function isBeforeBirth(photoDate, birthDate) {
+  const photo = calendarDate(photoDate);
+  const birth = calendarDate(birthDate);
+  return !!(photo && birth && photo < birth);
+}
+
+function formatPhotoDate(value) {
+  const day = calendarDate(value);
+  if (!day) return "Photo date unavailable";
+  const date = new Date(`${day}T00:00:00Z`);
+  return `Photo date: ${date.toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" })}`;
+}
+
 // --- Lazy per-asset face loading ---
 let skipAutoFixOnce = false; // set by undo to prevent auto-fix on the undone asset
 
@@ -439,6 +525,7 @@ async function showNextAsset() {
   while (currentIndex < assetIds.length) {
     const assetId = assetIds[currentIndex];
     currentItem = null;
+    $("#photo-date").textContent = formatPhotoDate(assetDates.get(assetId));
 
     updatePositionHeader();
 
@@ -482,11 +569,12 @@ async function showNextAsset() {
     if (scanMode === "duplicates" && !isDup) { console.log(`[skip] ${assetId}: not a duplicate (scan mode: duplicates only)`); currentIndex++; continue; }
     if (scanMode === "solos" && isDup) { console.log(`[skip] ${assetId}: not a solo (scan mode: solos only)`); currentIndex++; continue; }
 
-    currentItem = { assetId, faces, wrongFaces, correctPresent, isDup };
+    currentItem = { assetId, faces, wrongFaces, correctPresent, isDup, suggestions: new Map() };
+    $("#suggestions").textContent = "";
 
     // Auto-fix logic: check if Immich's top suggestion matches correctPerson
     // Skip auto-fix if we got here via undo — user wants to manually review
-    if (autoFixMode !== "off" && !shouldSkipAutoFix && !isDup) {
+    if (autoFixMode !== "off" && !shouldSkipAutoFix) {
       const autoFixResult = await tryAutoFix(wrongFaces, assetId);
       if (autoFixResult && autoFixResult.action === "instant") {
         currentIndex++;
@@ -499,6 +587,8 @@ async function showNextAsset() {
         currentItem.autoSkipPending = true;
       }
     }
+
+    showSuggestions(currentItem);
 
     // Load photo
     const img = $("#photo-img");
@@ -517,9 +607,9 @@ async function showNextAsset() {
     // Update shortcuts
     if (isDup) {
       const nums = wrongFaces.map((_, i) => `<kbd>${i + 1}</kbd>`).join(" / ");
-      $("#shortcut-help").innerHTML = `${nums} = reassign to ${esc(correctPerson.name)} &nbsp; <kbd>U</kbd>+# unassign &nbsp; <kbd>S</kbd> skip &nbsp; <kbd>Z</kbd> undo &nbsp; <kbd>Q</kbd> quit`;
+      $("#shortcut-help").innerHTML = `${nums} = reassign to ${esc(correctPerson.name)} &nbsp; <kbd>U</kbd>+# unassign &nbsp; <kbd>R</kbd> recheck &nbsp; <kbd>S</kbd> skip &nbsp; <kbd>Z</kbd> undo &nbsp; <kbd>Q</kbd> quit`;
     } else {
-      $("#shortcut-help").innerHTML = `<kbd>Y</kbd> reassign to ${esc(correctPerson.name)} &nbsp; <kbd>N</kbd> keep as ${esc(wrongPerson.name)} &nbsp; <kbd>U</kbd> unassign &nbsp; <kbd>S</kbd> skip &nbsp; <kbd>Z</kbd> undo &nbsp; <kbd>Q</kbd> quit`;
+      $("#shortcut-help").innerHTML = `<kbd>Y</kbd> reassign to ${esc(correctPerson.name)} &nbsp; <kbd>N</kbd> keep as ${esc(wrongPerson.name)} &nbsp; <kbd>U</kbd> unassign &nbsp; <kbd>R</kbd> recheck &nbsp; <kbd>S</kbd> skip &nbsp; <kbd>Z</kbd> undo &nbsp; <kbd>Q</kbd> quit`;
     }
 
     // Preload next asset's thumbnail
@@ -694,8 +784,9 @@ async function handleDuplicateUnassign(num) {
 
 async function undo() {
   if (undoStack.length === 0) return;
-  const action = undoStack.pop();
+  const action = undoStack[undoStack.length - 1];
   await reassignFaceAPI(action.faceId, action.oldPersonId);
+  undoStack.pop();
   // Clean up orphaned unnamed person from unassign
   if (action.wasUnassign && action.newPersonId) {
     try { await api(`/api/people/${action.newPersonId}`, { method: "DELETE" }); } catch (e) { console.warn("[undo] Failed to delete orphaned person:", e); }
@@ -745,7 +836,13 @@ function showSummary() {
 async function tryAutoFix(wrongFaces, assetId) {
   const facesToFix = [];
   for (const face of wrongFaces) {
-    const top = await getTopSuggestion(face.id);
+    let top;
+    try {
+      top = await getTopSuggestion(face.id);
+    } catch {
+      return null;
+    }
+    currentItem.suggestions.set(face.id, top);
     const label = top ? `${top.name} (${top.id})` : "none";
     if (top && top.id === correctPerson.id) {
       console.log(`[autofix] face ${face.id} → top suggestion: ${label} ✓ fix`);
@@ -772,7 +869,7 @@ async function tryAutoFix(wrongFaces, assetId) {
     return { action: "confirm-skip" };
   }
   if (autoFixMode === "instant") {
-    if (!await canAutoReassign(assetId, facesToFix)) return null;
+    if (!await canAutoReassign(assetId, facesToFix, wrongFaces)) return null;
     for (const face of facesToFix) {
       await reassignFaceAPI(face.id, correctPerson.id);
       undoStack.push({ faceId: face.id, oldPersonId: wrongPerson.id, assetId, wasAutoFixed: true });
@@ -792,12 +889,69 @@ async function getTopSuggestion(faceId) {
   return Array.isArray(list) && list.length > 0 ? list[0] : null;
 }
 
+async function showSuggestions(item, refresh = false) {
+  const container = $("#suggestions");
+  const request = item.suggestionRequest = (item.suggestionRequest || 0) + 1;
+  container.textContent = "Immich suggestions: loading…";
+  const results = await Promise.all(item.wrongFaces.map(async (face) => {
+    try {
+      const person = refresh || !item.suggestions.has(face.id)
+        ? await getTopSuggestion(face.id) : item.suggestions.get(face.id);
+      return { person };
+    } catch {
+      return { error: true };
+    }
+  }));
+  if (currentItem !== item || item.suggestionRequest !== request) return null;
+  results.forEach(({ person, error }, i) => {
+    if (!error) item.suggestions.set(item.wrongFaces[i].id, person);
+    else item.suggestions.delete(item.wrongFaces[i].id);
+  });
+  container.textContent = "";
+  results.forEach(({ person, error }, i) => {
+    if (i) container.append(" · ");
+    container.append(`Immich suggestion${item.isDup ? ` [${i + 1}]` : ""}: `);
+    if (!person) {
+      container.append(error ? "Unavailable" : "No suggestion");
+      return;
+    }
+    const name = person.name || `Unnamed person (${person.id.slice(0, 8)})`;
+    if (!immichBaseUrl) {
+      container.append(name);
+      return;
+    }
+    const link = document.createElement("a");
+    link.href = `${immichBaseUrl}/people/${encodeURIComponent(person.id)}`;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.style.color = "#e94560";
+    link.textContent = name;
+    container.appendChild(link);
+  });
+  return results;
+}
+
+async function recheckSuggestions() {
+  const item = currentItem;
+  if (!item || item.rechecking) return;
+  item.rechecking = true;
+  cancelCountdown();
+  item.autoFixableFaces = null;
+  item.autoSkipPending = false;
+  drawOverlays();
+  try {
+    await showSuggestions(item, true);
+  } finally {
+    item.rechecking = false;
+  }
+}
+
 async function autoReassignCurrent() {
   if (!countdownAutoFixFaces || !currentItem) return;
   const item = currentItem;
   const faces = countdownAutoFixFaces;
   countdownAutoFixFaces = null;
-  const safe = await canAutoReassign(item.assetId, faces);
+  const safe = await canAutoReassign(item.assetId, faces, item.wrongFaces);
   if (currentItem !== item) return;
   if (!safe) {
     alert("The photo could not be safely auto-fixed. Please review it manually.");
@@ -816,7 +970,7 @@ async function autoReassignCurrent() {
   showNextAsset();
 }
 
-async function canAutoReassign(assetId, candidates) {
+async function canAutoReassign(assetId, candidates, reviewedFaces) {
   if (candidates.length !== 1) return false;
   try {
     let faces;
@@ -825,8 +979,10 @@ async function canAutoReassign(assetId, candidates) {
     } catch {
       faces = await apiJSON(`/api/faces?assetId=${assetId}`);
     }
-    return Array.isArray(faces) &&
-      faces.filter(f => f.person && f.person.id === wrongPerson.id).length === 1 &&
+    if (!Array.isArray(faces)) return false;
+    const currentWrongFaces = faces.filter(f => f.person && f.person.id === wrongPerson.id);
+    return currentWrongFaces.length === reviewedFaces.length &&
+      currentWrongFaces.every(f => reviewedFaces.some(reviewed => reviewed.id === f.id)) &&
       faces.some(f => f.id === candidates[0].id && f.person && f.person.id === wrongPerson.id) &&
       !faces.some(f => f.person && f.person.id === correctPerson.id);
   } catch {
@@ -900,6 +1056,7 @@ document.addEventListener("keydown", (e) => {
   if ($("#review").style.display === "none") return;
   if (!currentItem) return;
   const key = e.key.toLowerCase();
+  if (currentItem.rechecking && key !== "q") return;
 
   // Handle countdown cancellation
   if (countdownTimer) {
@@ -925,7 +1082,8 @@ document.addEventListener("keydown", (e) => {
     if (key === "u") { handleSoloUnassign(); return; }
   }
 
-  if (key === "s") skip();
+  if (key === "r") recheckSuggestions();
+  else if (key === "s") skip();
   else if (key === "z") undo();
   else if (key === "q") showSummary();
 });

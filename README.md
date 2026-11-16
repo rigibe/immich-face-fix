@@ -38,6 +38,8 @@ Immich does **not** use averaged embeddings per person. It stores every individu
 - **Person pair selection** — pick the "wrong" person (has misassigned faces) and the "correct" person (who those faces belong to)
 - **Smart filtering** — review duplicates only (photos where both people appear), solos only, or both
 - **Auto-fix mode** — when Immich's own top suggestion matches the correct person, auto-reassign instantly or with a configurable countdown you can cancel
+- **Recheck a photo** — press `R` to fetch fresh Immich suggestions after correcting a match, without changing assignments
+- **Photo date** — see the photo's date while reviewing faces
 - **Face overlays & crops** — bounding boxes on the full photo plus zoomed-in face crops so you can see exactly what you're reassigning
 - **Unassign faces** — press `U` to remove a face from the wrong person entirely (creates a new unnamed person, same as Immich's "not this person"). In dup mode, press `U` then a number to pick which face
 - **Keyboard-driven** — `Y`/`N` for solo faces, `1`-`9` to pick which face in multi-face photos, `U` to unassign, `S` skip, `Z` undo, `Q` quit
@@ -151,6 +153,10 @@ and `node --test test/*.test.cjs` (Node.js is needed only for the JavaScript tes
    - `S` to skip, `Z` to undo last action, `Q` to quit
 6. **Summary** — shows totals for reviewed, reassigned, auto-fixed, unassigned, skipped, and undone
 
+Only photos owned by the account associated with the API key are included.
+Shared photos owned by another account are excluded; use that owner's account
+to correct their faces. If ownership cannot be verified, the review does not start.
+
 ## How It Works
 
 ### Architecture
@@ -161,15 +167,23 @@ All face reassignments use the official [Immich API](https://immich.app/docs/api
 
 ### Auto-Fix
 
+Photos dated before the correct person's birth date are excluded when Immich
+provides both dates. Photos with missing or invalid dates remain available for review.
+
 For each face assigned to the wrong person, the tool queries Immich for its top recognition suggestion. If Immich itself thinks the face belongs to the correct person, auto-fix can:
 
 - **Instant mode** — reassign immediately without showing the photo
 - **Confirm mode** — show the photo with a countdown timer; press any key to cancel and review manually
 - **Off** — always require manual review
 
-Photos with multiple faces assigned to the wrong person, or with the target person
-already present, require manual review. Before an automatic reassignment the app
-rechecks the photo; this check is not atomic with changes made elsewhere in Immich.
+For photos with multiple faces assigned to the wrong person, auto-fix proceeds only
+when every suggestion identifies either the wrong or the correct person. Automatic
+reassignment requires exactly one face to move and no target person already present.
+Before reassigning, the app rechecks the photo; this check is not atomic with changes
+made elsewhere in Immich.
+During review, `R` refreshes the current photo's
+suggestions without changing assignments or rerunning Immich's face detection
+or recognition jobs.
 
 ### Session Persistence
 
