@@ -11,26 +11,128 @@ import urllib.error
 import webbrowser
 
 
+# .env variable names, in order of preference
+URL_VARS = ("IMMICH_URL", "URL_IMMICH")
+API_KEY_VARS = ("IMMICH_API_KEY",)
+API_KEY_DEFAULT_VAR = API_KEY_VARS[0]
+
+# Some Immich instances sit behind a CDN/WAF (e.g. Cloudflare) that rejects
+# requests carrying urllib's default User-Agent, so send something normal.
+USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+
+
+def load_env_file(path):
+    """Parse a simple KEY=VALUE .env file and return a dict.
+
+    Supports blank lines, `#` comments, an optional `export ` prefix, and
+    single- or double-quoted values. Missing files are ignored.
+    """
+    values = {}
+    if not path or not os.path.isfile(path):
+        return values
+    with open(path, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            else:
+                # Strip trailing inline comment for unquoted values
+                hash_pos = value.find(" #")
+                if hash_pos != -1:
+                    value = value[:hash_pos].rstrip()
+            values[key] = value
+    return values
+
+
+def find_env_file(explicit):
+    """Return the .env path to use: explicit flag, next to this script, or its parent."""
+    if explicit:
+        return explicit
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base_dir, ".env"),
+        os.path.join(os.path.dirname(base_dir), ".env"),
+    ]
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def first_set(mapping, names):
+    for name in names:
+        value = mapping.get(name)
+        if value:
+            return value
+    return ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Immich Face Fix proxy server")
-    parser.add_argument("--immich-url", default=os.environ.get("IMMICH_URL", ""),
+    parser.add_argument("--immich-url", default=None,
                         help="Immich instance URL (e.g. https://photos.example.com)")
-    parser.add_argument("--api-key", default=os.environ.get("IMMICH_API_KEY", ""),
+    parser.add_argument("--api-key", default=None,
                         help="Immich API key")
-    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")),
+    parser.add_argument("--env-file", default=None,
+                        help="Path to .env file (default: .env next to this script, "
+                             "or in its parent directory)")
+    parser.add_argument("--api-key-var", default=API_KEY_DEFAULT_VAR,
+                        help=f".env variable holding the API key (default: {API_KEY_DEFAULT_VAR})")
+    parser.add_argument("--url-var", default=URL_VARS[0],
+                        help=f".env variable holding the Immich URL (default: {URL_VARS[0]})")
+    parser.add_argument("--port", type=int, default=None,
                         help="Local port (default: 8080)")
     args = parser.parse_args()
 
-    immich_url = args.immich_url.rstrip("/")
-    api_key = args.api_key.strip()
+    env_path = find_env_file(args.env_file)
+    env = load_env_file(env_path)
+
+    # Resolution order for each value: CLI flag > environment > .env file > built-in default.
+    url_names = tuple(dict.fromkeys((args.url_var, *URL_VARS)))
+    api_key_names = tuple(dict.fromkeys((args.api_key_var, *API_KEY_VARS)))
+    immich_url = (
+        args.immich_url
+        or first_set(os.environ, url_names)
+        or first_set(env, url_names)
+    ).rstrip("/")
+    api_key = (
+        args.api_key
+        or first_set(os.environ, api_key_names)
+        or first_set(env, api_key_names)
+    ).strip()
+    port = (
+        args.port
+        or int(os.environ.get("PORT") or env.get("PORT") or "8080")
+    )
 
     if not immich_url or not api_key:
-        parser.error("--immich-url and --api-key are required")
+        source = env_path or "no .env file found"
+        parser.error(
+            "--immich-url and --api-key are required "
+            f"(looked for {'/'.join(url_names)} and "
+            f"{'/'.join(api_key_names)} in {source})"
+        )
+
+    if env_path:
+        print(f"Loaded configuration from {env_path}")
 
     # Quick connectivity check
     test_url = immich_url + "/api/server/about"
     test_req = urllib.request.Request(test_url)
     test_req.add_header("x-api-key", api_key)
+    test_req.add_header("User-Agent", USER_AGENT)
     try:
         with urllib.request.urlopen(test_req) as resp:
             print(f"Connected to Immich (status {resp.status})")
@@ -47,6 +149,12 @@ def main():
     class Handler(http.server.SimpleHTTPRequestHandler):
         def __init__(self, *a, **kw):
             super().__init__(*a, directory=directory, **kw)
+
+        def end_headers(self):
+            # Keep editors honest: never let the browser reuse a stale index.html.
+            if not self.path.startswith("/api/"):
+                self.send_header("Cache-Control", "no-store, max-age=0")
+            super().end_headers()
 
         def do_GET(self):
             if self.path == "/api/_immich-url":
@@ -78,6 +186,7 @@ def main():
 
             req = urllib.request.Request(target, data=body, method=method)
             req.add_header("x-api-key", api_key)
+            req.add_header("User-Agent", self.headers.get("User-Agent", USER_AGENT))
             if self.headers.get("Content-Type"):
                 req.add_header("Content-Type", self.headers["Content-Type"])
             req.add_header("Accept", self.headers.get("Accept", "application/json"))
@@ -107,8 +216,8 @@ def main():
             if a:
                 print(f"  {' '.join(str(x) for x in a)}")
 
-    server = http.server.HTTPServer(("", args.port), Handler)
-    url = f"http://localhost:{args.port}/"
+    server = http.server.HTTPServer(("", port), Handler)
+    url = f"http://localhost:{port}/"
     print(f"Immich Face Fix running at {url}")
     print(f"Proxying to {immich_url}")
     threading.Timer(0.5, lambda: webbrowser.open(url)).start()

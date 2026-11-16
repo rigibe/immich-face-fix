@@ -86,12 +86,48 @@ These are the minimum permissions required. Do **not** use an "All" key if you w
 
 The tool opens automatically in your browser at `http://localhost:8080`.
 
+### Using a .env file
+
+Instead of passing credentials on the command line, `serve.py` reads them from a
+`.env` file. It looks first for `.env` next to `serve.py`, then in the parent
+directory, or you can point at one explicitly:
+
+```bash
+cp .env.example .env    # then fill in your values
+python3 serve.py --env-file /path/to/.env
+```
+
+The file holds the URL and API key:
+
+```dotenv
+IMMICH_URL=https://photos.example.com
+IMMICH_API_KEY=your-api-key-here
+```
+
+The key is read from `IMMICH_API_KEY`. To keep several keys in one file (for
+different accounts, say), name them as you like and select one with
+`--api-key-var`:
+
+```bash
+python3 serve.py --api-key-var IMMICH_API_KEY_WORK
+```
+
+Resolution order for every value is: command-line flag, then environment
+variable, then `.env` file, then the built-in default.
+
+A `.env` file inside `immich-face-fix/` takes precedence over the one in its
+parent directory. The page header shows the account that owns the API key in
+use.
+
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--immich-url` | Immich instance URL | `IMMICH_URL` env var |
-| `--api-key` | Immich API key | `IMMICH_API_KEY` env var |
+| `--immich-url` | Immich instance URL | `IMMICH_URL` / `URL_IMMICH` |
+| `--api-key` | Immich API key | value of `--api-key-var` |
+| `--env-file` | Path to a `.env` file | `.env` beside or above `serve.py` |
+| `--api-key-var` | `.env` variable holding the API key | `IMMICH_API_KEY` |
+| `--url-var` | `.env` variable holding the Immich URL | `IMMICH_URL` |
 | `--port` | Local port | 8080 |
 
 ## Usage
